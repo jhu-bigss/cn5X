@@ -75,6 +75,7 @@ class winMain(QtWidgets.QMainWindow):
     self.__settings = QSettings(QSettings.NativeFormat, QSettings.UserScope, ORG_NAME, APP_NAME)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--ros-args", action="store_true", help=self.tr("ROS arguments flag"))
     parser.add_argument("-c", "--connect", action="store_true", help=self.tr("Connect the serial port"))
     parser.add_argument("-f", "--file", help=self.tr("Load the GCode file"))
     parser.add_argument("-l", "--lang", help=self.tr("Define the interface language"))
