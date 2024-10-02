@@ -4,7 +4,7 @@
 '                                                                         '
 ' Copyright 2018-2023 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
-' This file is part of cn5X++                                             '
+' This file: cn5X_config.py is part of cn5X++                             '
 '                                                                         '
 ' cn5X++ is free software: you can redistribute it and/or modify it       '
 ' under the terms of the GNU General Public License as published by       '
@@ -22,12 +22,12 @@
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
 from enum import Enum
-from PyQt5 import QtGui
+from PyQt6 import QtGui
 
 ORG_NAME           = "fra589"
 APP_NAME           = "cn5X++"
-APP_VERSION_STRING = "0.8.9"
-APP_VERSION_DATE   = "20230418"
+APP_VERSION_STRING = "0.9.7"
+APP_VERSION_DATE   = "20240624"
 
 DEFAULT_NB_AXIS    = 3 # Laisser 3 permet de gerer un Grbl original a 3 axes
 DEFAULT_AXIS_NAMES = ['X', 'Y', 'Z']
@@ -42,6 +42,9 @@ class logSeverity(Enum):
   info    = 0
   warning = 1
   error =   2
+
+''' Mots GCode valides (cf. http://linuxcnc.org/docs/html/gcode/overview_fr.html) '''
+VALIDES_GCODE_WORDS = "ABCDFGHIJKMNPQRSTUVWXYZ"
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
@@ -148,8 +151,9 @@ DEFAULT_PROBE_RETRACT_DISTANCE_AFTER_Z  = 5
 DEFAULT_PROBE_ORIGINE_G54_Z             = True
 DEFAULT_PROBE_ORIGINE_G92_Z             = False
 DEFAULT_PROBE_ORIGINE_OFFSET_Z          = 0.0
-DEFAULT_TOOLSENSOR_POSITION_X           = -5
-DEFAULT_TOOLSENSOR_POSITION_Y           = -5
+DEFAULT_TOOLCHANGE_POSITION_Z           = -5
+DEFAULT_TOOLCHANGE_POSITION_X           = -5
+DEFAULT_TOOLCHANGE_POSITION_Y           = -5
 
 ''' Valeurs renvoyées par grblDecode.waitForGrblReply() et grblDecode.waitForGrblProbe() '''
 SIG_OK    = 0

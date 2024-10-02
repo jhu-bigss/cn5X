@@ -3,7 +3,7 @@
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
-' Copyright 2018-2022 Gauthier Brière (gauthier.briere "at" gmail.com)    '
+' Copyright 2018-2024 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
 ' This file: cn5X.py is part of cn5X++                                    '
 '                                                                         '
@@ -24,14 +24,18 @@
 
 import sys, os, time
 from datetime import datetime
-from xml.dom.minidom import parse, Node, Element
+from xml.dom.minidom import parse, parseString, Node, Element
 import locale
 import argparse
 import serial, serial.tools.list_ports
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QCoreApplication, QObject, QThread, pyqtSignal, pyqtSlot, QModelIndex,  QItemSelectionModel, QFileInfo, QTranslator, QLocale, QSettings
-from PyQt5.QtGui import QKeySequence, QStandardItemModel, QStandardItem, QValidator, QPalette, QFontDatabase
-from PyQt5.QtWidgets import QDialog, QAbstractItemView, QMessageBox
+from PyQt6 import QtCore, QtGui, QtWidgets, uic
+from PyQt6.QtCore import Qt, QCoreApplication, QObject, QThread, \
+                         pyqtSignal, pyqtSlot, QModelIndex, \
+                         QItemSelectionModel, QFileInfo, QTranslator, \
+                         QLocale, QSettings, QFile, QIODevice, QEvent, \
+                         QTimer
+from PyQt6.QtGui import QKeySequence, QStandardItemModel, QStandardItem, QValidator, QPalette, QFontDatabase, QAction, QShortcut
+from PyQt6.QtWidgets import QDialog, QAbstractItemView, QMessageBox
 from cn5X_config import *
 from msgbox import *
 from speedOverrides import *
@@ -39,10 +43,15 @@ from grblCom import grblCom
 from grblDecode import grblDecode
 from gcodeQLineEdit import gcodeQLineEdit
 from cnQPushButton import cnQPushButton
+from cnQLabel import cnQLabel
+from cnled import cnLed
 from grblJog import grblJog
 from grblProbe import *
 from cn5X_gcodeFile import gcodeFile
 from qwprogressbox import *
+from qwkeyboard import *
+from qwkeynum import *
+from qwblackscreen import *
 from grblConfig import grblConfig
 from cn5X_apropos import cn5XAPropos
 from cn5X_helpProbe import cn5XHelpProbe
@@ -50,19 +59,92 @@ from grblG92 import dlgG92
 from grblG28_30_1 import dlgG28_30_1
 from cn5X_jog import dlgJog
 from cn5X_beep import cn5XBeeper
+from cn5X_toolChange import dlgToolChange
+###import cn5X_rc
+
 
 class upperCaseValidator(QValidator):
   def validate(self, string, pos):
-    return QValidator.Acceptable, string.upper(), pos
+    return QValidator.State.Acceptable, string.upper(), pos
 
-import mainWindow
+
+class longClickEventFilter(QObject):
+  def __init__(self, win, parent=None):
+    super().__init__()
+    self.__win = win
+    self.__Timer = QTimer()
+
+  def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+    ''' Lance le signal d'appel du menu contextuel après un click gauche de plus de 1.5 secondes '''
+    if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+      if self.__win.ui.tabMainPage.isEnabled():
+        if not self.__Timer.isActive():
+          try:
+            self.__Timer.timeout.disconnect()
+          except TypeError:
+            pass
+          self.__Timer.timeout.connect(lambda: obj.customContextMenuRequested.emit(event.position().toPoint()))
+          self.__Timer.setSingleShot(True)
+          self.__Timer.start(1500)
+      
+    elif event.type() == QEvent.Type.MouseButtonRelease:
+      self.__Timer.stop()
+
+    return super().eventFilter(obj, event)
+
+
+class appEventFilter(QObject):
+  def __init__(self, win, parent=None):
+    super().__init__()
+    self.__win = win
+
+  def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+    # mémorise le moment du dernier évennement clavier ou souris
+    if event.type() in [QEvent.Type.KeyPress, QEvent.Type.KeyRelease, QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease]:
+      maintenant = time.time()
+      self.__win.lastActivity = maintenant
+      # Masque l'écran de veille si affiché
+      if self.__win.blackScreen.isVisible():
+        self.__win.blackScreen.blackScreen_hide()
+        return True # Bloque la suite du traitement de l'évennement
+    return super().eventFilter(obj, event)
+
+
+class focusEventFilter(QObject):
+  
+  def __init__(self, keyNum, parent=None):
+    self.__keyNum = keyNum
+    self.parent = parent
+    super().__init__()
+
+  def eventFilter(self, widget, event):
+    # FocusIn event
+    if event.type() == QEvent.Type.FocusIn:
+      if self.__keyNum.parent.showKeynum:
+        if self.__keyNum.parent.qwKeyboard.isKeyboardVisible():
+          self.__keyNum.parent.qwKeyboard.keyboard_hide()
+          self.__keyNum.parent.ui.btnKeyboard.setText("⇧⌨⇧")
+        # Affiche le pavé numérique
+        self.__keyNum.setLinkedTxt(widget)
+        self.__keyNum.keynum_show()
+
+    # FocusOut event
+    if event.type() == QEvent.Type.FocusOut:
+      if self.__keyNum.isVisible():
+        # Masque le pavé numérique
+        self.__keyNum.setLinkedTxt(None)
+        self.__keyNum.keynum_hide()
+
+    # Return False pour l'execution standard de l'event
+    return False
+
 
 class winMain(QtWidgets.QMainWindow):
 
   def __init__(self, parent=None):
 
     # Force le curseur souris sablier
-    QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+    QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
     QtWidgets.QMainWindow.__init__(self, parent)
 
@@ -72,7 +154,7 @@ class winMain(QtWidgets.QMainWindow):
     self.__gcode_recall_flag = False
     self.__gcode_current_txt = ""
 
-    self.__settings = QSettings(QSettings.NativeFormat, QSettings.UserScope, ORG_NAME, APP_NAME)
+    self.__settings = QSettings(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, ORG_NAME, APP_NAME)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ros-args", action="store_true", help=self.tr("ROS arguments flag"))
@@ -80,6 +162,7 @@ class winMain(QtWidgets.QMainWindow):
     parser.add_argument("-f", "--file", help=self.tr("Load the GCode file"))
     parser.add_argument("-l", "--lang", help=self.tr("Define the interface language"))
     parser.add_argument("-p", "--port", help=self.tr("select the serial port"))
+    parser.add_argument("-s", "--fullScreen", action="store_true", help=self.tr("Set appliation full screen mode"))
     parser.add_argument("-u", "--noUrgentStop", action="store_true", help=self.tr("Unlock urgent stop"))
     self.__args = parser.parse_args()
 
@@ -87,11 +170,70 @@ class winMain(QtWidgets.QMainWindow):
     self.__licenceFile = "{}/COPYING".format(app_path)
 
     # Initialise la fenêtre princpale
-    self.ui = mainWindow.Ui_mainWindow()
-    self.ui.setupUi(self)
+    saveDir = os.getcwd()
+    os.chdir(os.path.dirname(__file__))
+    ###self.ui = uic.loadUi(os.path.join(os.path.dirname(__file__), "mainWindow.ui"), self)
+    self.ui = uic.loadUi("mainWindow.ui", self)
+    os.chdir(saveDir)
+    
+    # Affichage plein écran et screen saver
+    fullScreenSetting = self.__settings.value("displayFullScreen", False, type=bool)
 
-    self.btnUrgencePictureLocale = ":/cn5X/images/btnUrgence.svg"
-    self.btnUrgenceOffPictureLocale = ":/cn5X/images/btnUrgenceOff.svg"
+    if self.__args.fullScreen != False:
+      # L'argument de la ligne de commande est prioritaire
+      # sur l'état sauvegardé dans les settings
+      self.showFullScreen()
+      self.ui.mnuDisplay_full_sceen.setChecked(True)
+    else:
+      # Pas d'argument enligne de commande,
+      # on regarde l'état sauvegardé dans les settings
+      if fullScreenSetting:
+        self.showFullScreen()
+        self.ui.mnuDisplay_full_sceen.setChecked(True)
+      else:
+        self.showNormal()
+        self.ui.mnuDisplay_full_sceen.setChecked(False)
+
+    # Widget pour mise en veille
+    self.screenSaverClock = self.__settings.value("screenSaverClock", True, type=bool)
+    if self.screenSaverClock:
+      self.ui.mnuScreenSaverClock.setChecked(True)
+    else:
+      self.ui.mnuScreenSaverClock.setChecked(False)
+
+    self.blackScreen = qwBlackScreen(self)
+    self.timerVeille = QTimer()
+    self.timerVeille.setInterval(1000) # 1 seconde
+    self.timerVeille.timeout.connect(self.veilleEcran)
+
+    # Parametre de mise en veille
+    # Valeurs possibles : 1, 5, 20, 60, 120, 360, -1 (off)
+    self.__screenSaverTimeout = int(self.__settings.value("screenSaverTimeout", -1))
+    self.updateMnuBlackScreen() # Coche le bon élément du menu de veille
+
+    # Démarre le timer si veille d'écran active et affiché en plein écran
+    if self.__screenSaverTimeout in [1, 5, 20, 60, 120, 360] \
+    and self.ui.mnuDisplay_full_sceen.isChecked():
+      self.timerVeille.start()
+
+    # Initialise la boite de progression d'un fichier programme GCode
+    self.__pBox = qwProgressBox(self)
+    
+    # initialise le clavier
+    self.qwKeyboard = qwKeyboard(self)
+    self.qwKeyboard.setLinkedTxt(self.ui.txtGCode)
+    
+    # Pavé numérique
+    self.showKeynum = self.__settings.value("showKeynum", False, type=bool)
+    self.ui.mnuShowKeynum.setChecked(self.showKeynum)
+    self.__qwKeyNum = qwKeyNum(self)
+    self.__numInputFilter = focusEventFilter(self.__qwKeyNum)
+    
+    for dbsInput in self.findChildren(QtWidgets.QDoubleSpinBox):
+      dbsInput.installEventFilter(self.__numInputFilter)
+    
+    self.btnUrgencePictureLocale    = os.path.join(os.path.dirname(__file__), "images/btnUrgence.svg")
+    self.btnUrgenceOffPictureLocale = os.path.join(os.path.dirname(__file__), "images/btnUrgenceOff.svg")
 
     # création du menu des langues
     self.createLangMenu()
@@ -103,12 +245,9 @@ class winMain(QtWidgets.QMainWindow):
     self.logGrbl.document().setMaximumBlockCount(2000)  # Limite la taille des logs a 2000 lignes
     self.logCn5X.document().setMaximumBlockCount(2000)  # Limite la taille des logs a 2000 lignes
     self.logDebug.document().setMaximumBlockCount(2000) # Limite la taille des logs a 2000 lignes
-    self.ui.qtabConsole.setCurrentIndex(CN5X_TAB_LOG)               # Active le tab de la log cn5X++
+    self.ui.qtabConsole.setCurrentIndex(CN5X_TAB_LOG)   # Active le tab de la log cn5X++
 
-    self.__gcodeFile = gcodeFile(self.ui, self.ui.gcodeTable)
-    self.__gcodeFile.sig_log.connect(self.on_sig_log)
-
-    self.timerDblClic = QtCore.QTimer()
+    self.timerDblClic = QTimer()
 
     self.__grblCom = grblCom()
     self.__grblCom.sig_log.connect(self.on_sig_log)
@@ -127,13 +266,22 @@ class winMain(QtWidgets.QMainWindow):
     self.__grblCom.sig_serialLock.connect(self.on_sig_serialLock)
 
     self.__beeper = cn5XBeeper();
-    
+
     self.__arretUrgence     = True
     def arretUrgence():
       return self.__arretUrgence
 
     self.__decode = grblDecode(self.ui, self.log, self.__grblCom, self.__beeper, arretUrgence)
+    self.__decode.sig_log.connect(self.on_sig_log)
+    self.__pBox.setDecoder(self.__decode)    
     self.__grblCom.setDecodeur(self.__decode)
+
+    # Boite de dialogue de changement d'outils
+    self.__dlgToolChange = dlgToolChange(self, self.__grblCom, self.__decode, DEFAULT_NB_AXIS, DEFAULT_AXIS_NAMES)
+    self.__dlgToolChange.setParent(self)
+
+    self.__gcodeFile = gcodeFile(self.ui, self.ui.gcodeTable, self.__dlgToolChange)
+    self.__gcodeFile.sig_log.connect(self.on_sig_log)
 
     self.__jog = grblJog(self.__grblCom)
     self.ui.dsbJogSpeed.setValue(DEFAULT_JOG_SPEED)
@@ -142,8 +290,6 @@ class winMain(QtWidgets.QMainWindow):
     self.__probe = grblProbe(self.__grblCom)
     self.__probe.sig_log.connect(self.on_sig_log)
     self.__probeResult       = None
-    self.__initialToolLenght = False
-    self.__initialProbeZ     = False
     
     self.__connectionStatus = False
     self.__cycleRun         = False
@@ -173,7 +319,6 @@ class winMain(QtWidgets.QMainWindow):
 
     self.setTranslator(langue)
 
-    QtGui.QFontDatabase.addApplicationFont(":/cn5X/fonts/LEDCalculator.ttf")  # Police type "LED"
     self.ui.btnConnect.setText(self.tr("Connect"))                            # Label du bouton connect
     self.populatePortList()                                                   # On rempli la liste des ports serie
 
@@ -203,6 +348,11 @@ class winMain(QtWidgets.QMainWindow):
     # Flag pour unicité de la boite de dialogue Jog
     self.dlgJog = None
 
+    self.iconLinkOn  = QtGui.QIcon()
+    self.iconLinkOff = QtGui.QIcon()
+    self.iconLinkOn.addPixmap(QtGui.QPixmap(os.path.join(os.path.dirname(__file__), "images/btnLinkOn.svg")), QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.On)
+    self.iconLinkOff.addPixmap(QtGui.QPixmap(os.path.join(os.path.dirname(__file__), "images/btnLinkOff.svg")), QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.On)
+
     '''---------- Connections des evennements de l'interface graphique ----------'''
     
     self.ui.btnUrgence.pressed.connect(self.on_arretUrgence)             # Evenements du bouton d'arret d'urgence
@@ -219,7 +369,9 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.mnuConfirm_Go_to_G30.triggered.connect(self.on_mnuConfirm_Go_to_G30)
     self.ui.mnuConfirm_define_G28.triggered.connect(self.on_mnuConfirm_define_G28)
     self.ui.mnuConfirm_define_G30.triggered.connect(self.on_mnuConfirm_define_G30)
-    
+    self.ui.mnuPrefToolChange.triggered.connect(self.on_mnuPrefToolChange)
+    self.ui.mnuIgnoreFirstToolChange.triggered.connect(self.on_mnuIgnoreFirstToolChange)
+
     self.ui.mnuAppQuitter.triggered.connect(self.on_mnuAppQuitter)
 
     self.ui.mnu_GrblConfig.triggered.connect(self.on_mnu_GrblConfig)
@@ -238,8 +390,9 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.mnuSaveG92.triggered.connect(self.on_mnuSaveG92)
     self.ui.mnuRestoreG92.triggered.connect(self.on_mnuRestoreG92)
     self.ui.mnuG92_1.triggered.connect(self.on_mnuG92_1)
-    
+
     self.ui.mnuJog_to.triggered.connect(self.on_mnuJog_to)
+    self.ui.mnuToolChange.triggered.connect(self.on_mnuToolChange)
 
     # Sous-menu G28/G30
     self.ui.mnuPredefinedLocations.aboutToShow.connect(self.on_mnuPredefinedLocations)
@@ -251,6 +404,20 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.mnuDebug_mode.triggered.connect(self.on_mnuDebug_mode)
     self.ui.mnuResetSerial.triggered.connect(self.on_mnuResetSerial)
 
+    # Menu Display
+    self.ui.mnuDisplay_full_sceen.triggered.connect(self.on_mnuDisplay_full_sceen)
+    self.ui.mnuDisplay_icon.triggered.connect(self.on_mnuDisplay_icon)
+    self.ui.mnuBlackScreen0.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(0))
+    self.ui.mnuBlackScreen1.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(1))
+    self.ui.mnuBlackScreen5.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(5))
+    self.ui.mnuBlackScreen20.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(20))
+    self.ui.mnuBlackScreen60.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(60))
+    self.ui.mnuBlackScreen120.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(120))
+    self.ui.mnuBlackScreen360.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(360))
+    self.ui.mnuBlackScreenOff.triggered.connect(lambda: self.on_mnuDisplayBlackScreen(-1))
+    self.ui.mnuScreenSaverClock.triggered.connect(self.on_mnuScreenSaverClock)
+    self.ui.mnuShowKeynum.triggered.connect(self.on_mnuShowKeynum)
+
     # Menu d'aide
     self.ui.mnuHelpProbe_single_axis.triggered.connect(lambda: self.on_mnuHelpProbe(MENU_SINGLE_AXIS))
     self.ui.mnuHelpProbe_inside_corner.triggered.connect(lambda: self.on_mnuHelpProbe(MENU_INSIDE_CORNER))
@@ -261,6 +428,7 @@ class winMain(QtWidgets.QMainWindow):
 
     self.ui.btnRefresh.clicked.connect(self.populatePortList)            # Refresh de la liste des ports serie
     self.ui.btnConnect.clicked.connect(self.action_btnConnect)           # un clic sur le bouton "(De)Connecter" appellera la methode 'action_btnConnect'
+    self.ui.btnKeyboard.pressed.connect(self.showKeyboard)               # Bouton d'affichage du clavier touch screen
     self.ui.btnSend.pressed.connect(self.sendCmd)                        # Bouton d'envoi de commandes unitaires
     self.ui.txtGCode.setValidator(self.ucase)                            # Force la saisie des GCodes en majuscules
     self.ui.txtGCode.returnPressed.connect(self.sendCmd)                 # Meme fonction par la touche entree que le bouton d'envoi
@@ -333,9 +501,10 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.btnStop.clicked.connect(self.stopCycle)
     self.ui.btnG28.clicked.connect(self.on_gotoG28)
     self.ui.btnG30.clicked.connect(self.on_gotoG30)
+    
+    QShortcut(Qt.Key.Key_F7, self.ui.gcodeTable, activated=self.on_GCodeTable_key_F7_Pressed)
+    QShortcut(Qt.Key.Key_F8, self.ui.gcodeTable, activated=self.on_GCodeTable_key_F8_Pressed)
     self.ui.gcodeTable.customContextMenuRequested.connect(self.on_gcodeTableContextMenu)
-    QtWidgets.QShortcut(QtCore.Qt.Key_F7, self.ui.gcodeTable, activated=self.on_GCodeTable_key_F7_Pressed)
-    QtWidgets.QShortcut(QtCore.Qt.Key_F8, self.ui.gcodeTable, activated=self.on_GCodeTable_key_F8_Pressed)
     self.ui.dialAvance.customContextMenuRequested.connect(self.on_dialAvanceContextMenu)
     self.ui.dialBroche.customContextMenuRequested.connect(self.on_dialBrocheContextMenu)
     self.ui.lblLblPosX.customContextMenuRequested.connect(lambda: self.on_lblPosContextMenu(0))
@@ -360,6 +529,33 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.lblG58.customContextMenuRequested.connect(lambda: self.on_lblGXXContextMenu(5))
     self.ui.lblG59.customContextMenuRequested.connect(lambda: self.on_lblGXXContextMenu(6))
 
+    self.longClickEvent = longClickEventFilter(self)
+    
+    self.ui.gcodeTable.installEventFilter(self.longClickEvent)
+    self.ui.dialAvance.installEventFilter(self.longClickEvent)
+    self.ui.dialBroche.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosX.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosY.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosZ.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosA.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosB.installEventFilter(self.longClickEvent)
+    self.ui.lblLblPosC.installEventFilter(self.longClickEvent)
+    self.ui.lblPosX.installEventFilter(self.longClickEvent)
+    self.ui.lblPosY.installEventFilter(self.longClickEvent)
+    self.ui.lblPosZ.installEventFilter(self.longClickEvent)
+    self.ui.lblPosA.installEventFilter(self.longClickEvent)
+    self.ui.lblPosB.installEventFilter(self.longClickEvent)
+    self.ui.lblPosC.installEventFilter(self.longClickEvent)
+    self.ui.lblPlan.installEventFilter(self.longClickEvent)
+    self.ui.lblUnites.installEventFilter(self.longClickEvent)
+    self.ui.lblCoord.installEventFilter(self.longClickEvent)
+    self.ui.lblG54.installEventFilter(self.longClickEvent)
+    self.ui.lblG55.installEventFilter(self.longClickEvent)
+    self.ui.lblG56.installEventFilter(self.longClickEvent)
+    self.ui.lblG57.installEventFilter(self.longClickEvent)
+    self.ui.lblG58.installEventFilter(self.longClickEvent)
+    self.ui.lblG59.installEventFilter(self.longClickEvent)
+
     self.ui.rbtProbeInsideXY.toggled.connect(self.setProbeButtonsToolTip)
     
     # Changement d'onglets
@@ -368,12 +564,14 @@ class winMain(QtWidgets.QMainWindow):
 
     # Boutons de probe Z
     self.ui.btnProbeZ.clicked.connect(self.on_btnProbeZ)
+    self.ui.btnSaveToolChangePosition.clicked.connect(self.on_btnSaveToolChangePosition)
     self.ui.btnGoToSensor.clicked.connect(self.on_btnGoToSensor)
     self.ui.btnG49.clicked.connect(self.on_btnG49)
     self.ui.btnG43_1.clicked.connect(self.on_btnG43_1)
     self.ui.btnSetOriginZ.clicked.connect(self.on_btnSetOriginZ)
     self.ui.chkSeekZ.clicked.connect(self.on_chkSeekZ)
     self.ui.chkSeekXY.clicked.connect(self.on_chkSeekXY)
+    self.ui.chkInvertProbePinZ.clicked.connect(self.on_chkInvertProbePinZ)
 
     # Onglet probe XY
     self.ui.dsbToolDiameter.valueChanged.connect(self.on_dsbToolDiameterValueChanged)
@@ -396,6 +594,7 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.btnHomePlusX.clicked.connect(lambda: self.on_btnHomeXY("plusX"))
     self.ui.btnHomePlusY.clicked.connect(lambda: self.on_btnHomeXY("plusY"))
     self.ui.btnResetResults.clicked.connect(self.resetProbeResults)
+    self.ui.chkInvertProbePinXY.clicked.connect(self.on_chkInvertProbePinXY)
 
     #--------------------------------------------------------------------------------------
     # Traitement des arguments de la ligne de commande
@@ -427,17 +626,28 @@ class winMain(QtWidgets.QMainWindow):
     # Active ou desactive les boutons de cycle
     self.setEnableDisableGroupes()
 
-    # Initialise la boite de progression d'un fichier programme GCode
-    self.__pBox = qwProgressBox(self)
-    self.__pBoxArmee = False
-
     # Restore le curseur souris sablier en fin d'initialisation
     QtWidgets.QApplication.restoreOverrideCursor()
+    
+    # Memorise le moment de la dernière activité sur l'interface
+    # (clavier ou souris)
+    self.lastActivity = time.time()
     
     ### GBGB tests ###
     ###print(locale.getlocale(locale.LC_TIME))
     ###print(datetime.now().strftime("%A %x %H:%M:%S"))
-    ### Pour debug de qwProgressBox ### self.__pBox.start()
+    ### Pour debug de qwProgressBox 
+    ###self.__pBox.start()
+
+
+  @property
+  def lastActivity(self):
+    return self._lastActivity
+
+
+  @lastActivity.setter
+  def lastActivity(self, value):
+    self._lastActivity = value
 
 
   def populatePortList(self):
@@ -476,44 +686,44 @@ class winMain(QtWidgets.QMainWindow):
   def setProbeButtonsToolTip(self):
     '''Change probe XY interface intérieur ou extérieur'''
     if self.ui.rbtProbeInsideXY.isChecked():
-      self.ui.btnProbeXY_0.changeIcon(":/cn5X/images/btnProbeInCercle.svg")
+      self.ui.btnProbeXY_0.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInCercle.svg"))
       self.ui.btnProbeXY_0.setToolTip(self.tr('Run probe in X+, X-, Y+ and Y- direction to find inside center.'))
-      self.ui.btnProbeXY_1.changeIcon(":/cn5X/images/btnProbeInX-Y+.svg")
+      self.ui.btnProbeXY_1.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX-Y+.svg"))
       self.ui.btnProbeXY_1.setToolTip(self.tr('Run probe in X- and Y+ direction.'))
-      self.ui.btnProbeXY_2.changeIcon(":/cn5X/images/btnProbeInY+.svg")
-      self.ui.btnProbeXY_2.setToolTip("Run probe in Y+ direction.")
-      self.ui.btnProbeXY_3.changeIcon(":/cn5X/images/btnProbeInX+Y+.svg")
+      self.ui.btnProbeXY_2.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInY+.svg"))
+      self.ui.btnProbeXY_2.setToolTip(self.tr("Run probe in Y+ direction."))
+      self.ui.btnProbeXY_3.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX+Y+.svg"))
       self.ui.btnProbeXY_3.setToolTip(self.tr('Run probe in X+ and Y+ direction.'))
-      self.ui.btnProbeXY_4.changeIcon(":/cn5X/images/btnProbeInX+.svg")
-      self.ui.btnProbeXY_4.setToolTip("Run probe in X+ direction.")
-      self.ui.btnProbeXY_5.changeIcon(":/cn5X/images/btnProbeInX+Y-.svg")
+      self.ui.btnProbeXY_4.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX+.svg"))
+      self.ui.btnProbeXY_4.setToolTip(self.tr("Run probe in X+ direction."))
+      self.ui.btnProbeXY_5.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX+Y-.svg"))
       self.ui.btnProbeXY_5.setToolTip(self.tr('Run probe in X+ and Y- direction.'))
-      self.ui.btnProbeXY_6.changeIcon(":/cn5X/images/btnProbeInY-.svg")
-      self.ui.btnProbeXY_6.setToolTip("Run probe in Y- direction.")
-      self.ui.btnProbeXY_7.changeIcon(":/cn5X/images/btnProbeInX-Y-.svg")
+      self.ui.btnProbeXY_6.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInY-.svg"))
+      self.ui.btnProbeXY_6.setToolTip(self.tr("Run probe in Y- direction."))
+      self.ui.btnProbeXY_7.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX-Y-.svg"))
       self.ui.btnProbeXY_7.setToolTip(self.tr('Run probe in X- and Y- direction.'))
-      self.ui.btnProbeXY_8.changeIcon(":/cn5X/images/btnProbeInX-.svg")
-      self.ui.btnProbeXY_8.setToolTip("Run probe in X- direction.")
+      self.ui.btnProbeXY_8.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeInX-.svg"))
+      self.ui.btnProbeXY_8.setToolTip(self.tr("Run probe in X- direction."))
     
     else: # self.ui.rbtProbeOutsideXY.isChecked()
-      self.ui.btnProbeXY_0.changeIcon(":/cn5X/images/btnProbeOutCercle.svg")
+      self.ui.btnProbeXY_0.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutCercle.svg"))
       self.ui.btnProbeXY_0.setToolTip(self.tr('Run probe in X+, X-, Y+ and Y- direction to find outside center.'))
-      self.ui.btnProbeXY_1.changeIcon(":/cn5X/images/btnProbeOutX+Y-.svg")
+      self.ui.btnProbeXY_1.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX+Y-.svg"))
       self.ui.btnProbeXY_1.setToolTip(self.tr('Run probe in X+ and Y- direction.'))
-      self.ui.btnProbeXY_2.changeIcon(":/cn5X/images/btnProbeOutY-.svg")
-      self.ui.btnProbeXY_2.setToolTip("Run probe in Y- direction.")
-      self.ui.btnProbeXY_3.changeIcon(":/cn5X/images/btnProbeOutX-Y-.svg")
+      self.ui.btnProbeXY_2.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutY-.svg"))
+      self.ui.btnProbeXY_2.setToolTip(self.tr("Run probe in Y- direction."))
+      self.ui.btnProbeXY_3.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX-Y-.svg"))
       self.ui.btnProbeXY_3.setToolTip(self.tr('Run probe in X- and Y- direction.'))
-      self.ui.btnProbeXY_4.changeIcon(":/cn5X/images/btnProbeOutX-.svg")
-      self.ui.btnProbeXY_4.setToolTip("Run probe in X- direction.")
-      self.ui.btnProbeXY_5.changeIcon(":/cn5X/images/btnProbeOutX-Y+.svg")
+      self.ui.btnProbeXY_4.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX-.svg"))
+      self.ui.btnProbeXY_4.setToolTip(self.tr("Run probe in X- direction."))
+      self.ui.btnProbeXY_5.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX-Y+.svg"))
       self.ui.btnProbeXY_5.setToolTip(self.tr('Run probe in X- and Y+ direction.'))
-      self.ui.btnProbeXY_6.changeIcon(":/cn5X/images/btnProbeOutY+.svg")
-      self.ui.btnProbeXY_6.setToolTip("Run probe in Y+ direction.")
-      self.ui.btnProbeXY_7.changeIcon(":/cn5X/images/btnProbeOutX+Y+.svg")
+      self.ui.btnProbeXY_6.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutY+.svg"))
+      self.ui.btnProbeXY_6.setToolTip(self.tr("Run probe in Y+ direction."))
+      self.ui.btnProbeXY_7.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX+Y+.svg"))
       self.ui.btnProbeXY_7.setToolTip(self.tr('Run probe in X+ and Y+ direction.'))
-      self.ui.btnProbeXY_8.changeIcon(":/cn5X/images/btnProbeOutX+.svg")
-      self.ui.btnProbeXY_8.setToolTip("Run probe in X+ direction.")
+      self.ui.btnProbeXY_8.changeIcon(os.path.join(os.path.dirname(__file__), "images/btnProbeOutX+.svg"))
+      self.ui.btnProbeXY_8.setToolTip(self.tr("Run probe in X+ direction."))
     
 
   def setEnableDisableConnectControls(self):
@@ -604,17 +814,20 @@ class winMain(QtWidgets.QMainWindow):
         self.ui.mnuSet_origine.setEnabled(False)
         self.ui.mnuPredefinedLocations.setEnabled(False)
         self.ui.mnuJog_to.setEnabled(False)
+        self.ui.mnuToolChange.setEnabled(False)
       else:
         self.ui.mnu_GrblConfig.setEnabled(False)
         self.ui.mnuSet_origine.setEnabled(True)
         self.ui.mnuPredefinedLocations.setEnabled(True)
         self.ui.mnuJog_to.setEnabled(True)
+        self.ui.mnuToolChange.setEnabled(True)
     else:
       self.ui.mnu_MPos.setEnabled(False)
       self.ui.mnu_WPos.setEnabled(False)
       self.ui.mnuSet_origine.setEnabled(False)
       self.ui.mnuPredefinedLocations.setEnabled(False)
       self.ui.mnuJog_to.setEnabled(False)
+      self.ui.mnuToolChange.setEnabled(False)
       self.ui.mnuResetSerial.setEnabled(False)
       self.ui.mnu_GrblConfig.setEnabled(False)
 
@@ -626,7 +839,7 @@ class winMain(QtWidgets.QMainWindow):
     if fileName[0] != "":
       # Lecture du fichier
       # Curseur sablier
-      QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+      QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
       RC = self.__gcodeFile.readFile(fileName[0])
       if RC:
         # Selectionne l'onglet du fichier sauf en cas de debug
@@ -667,6 +880,8 @@ class winMain(QtWidgets.QMainWindow):
     self.ui.mnuConfirm_Go_to_G30.setChecked(not self.__settings.value("dontConfirmG30", False, type=bool))
     self.ui.mnuConfirm_define_G28.setChecked(not self.__settings.value("dontConfirmG28.1", False, type=bool))
     self.ui.mnuConfirm_define_G30.setChecked(not self.__settings.value("dontConfirmG30.1", False, type=bool))
+    self.ui.mnuPrefToolChange.setChecked(self.__settings.value("useToolChange", True, type=bool))
+    self.ui.mnuIgnoreFirstToolChange.setChecked(self.__settings.value("ignoreFirstToolChange", False, type=bool))
 
 
   @pyqtSlot()
@@ -690,6 +905,16 @@ class winMain(QtWidgets.QMainWindow):
 
 
   @pyqtSlot()
+  def on_mnuPrefToolChange(self):
+    self.__settings.setValue("useToolChange", self.ui.mnuPrefToolChange.isChecked())
+
+
+  @pyqtSlot()
+  def on_mnuIgnoreFirstToolChange(self):
+    self.__settings.setValue("ignoreFirstToolChange", self.ui.mnuIgnoreFirstToolChange.isChecked())
+
+
+  @pyqtSlot()
   def on_mnuAppQuitter(self):
     self.close()
 
@@ -706,6 +931,7 @@ class winMain(QtWidgets.QMainWindow):
     else:
       self.__statusText = "Bye-bye..."
       self.ui.statusBar.showMessage(self.__statusText)
+      os._exit(0)
       event.accept() # let the window close
 
 
@@ -721,6 +947,108 @@ class winMain(QtWidgets.QMainWindow):
     if self.ui.mnu_WPos.isChecked():
       param10 = 255 ^ 1 # Met le bit 1 a 0
       self.__grblCom.gcodeInsert("$10=" + str(param10))
+
+
+  @pyqtSlot()
+  def on_mnuDisplay_full_sceen(self):
+    if self.ui.mnuDisplay_full_sceen.isChecked():
+      self.showFullScreen()
+      # Démarre le timer si veille d'écran active et affiché en plein écran
+      if self.__screenSaverTimeout in [1, 5, 20, 60, 120, 360]:
+        self.timerVeille.start()
+      # Mémorise l'état dans les settings
+      self.__settings.setValue("displayFullScreen", True)
+    else:
+      self.showNormal()
+      # Stop le timer de veille d'écran
+      self.timerVeille.stop()
+      # Mémorise l'état dans les settings
+      self.__settings.setValue("displayFullScreen", False)
+
+
+  @pyqtSlot()
+  def on_mnuDisplay_icon(self):
+    self.showMinimized()
+
+
+  @pyqtSlot()
+  def on_mnuShowKeynum(self):
+    if self.ui.mnuShowKeynum.isChecked():
+      self.showKeynum = True
+      self.__settings.setValue("showKeynum", True)
+    else:
+      self.showKeynum = False
+      self.__settings.setValue("showKeynum", False)
+
+
+  @pyqtSlot()
+  def on_mnuScreenSaverClock(self):
+    if self.ui.mnuScreenSaverClock.isChecked():
+      self.screenSaverClock = True
+      self.__settings.setValue("screenSaverClock", True)
+    else:
+      self.screenSaverClock = False
+      self.__settings.setValue("screenSaverClock", False)
+
+
+  @pyqtSlot()
+  def on_mnuDisplayBlackScreen(self, duree):
+    ''' Parametrage veille écran '''
+    if duree == 0:
+      # Black screen immédiat et on sort (pas de changement des paramètres
+      # sur une mise en veille immédiate)
+      self.blackScreen.blackScreen_show()
+      return
+    elif duree != -1:
+      # Démarre le timer
+      self.timerVeille.start()
+    else:
+      # arrete le timer
+      self.timerVeille.stop()
+    # Mémorise la nouvelle durée
+    self.__screenSaverTimeout = duree
+    self.__settings.setValue("screenSaverTimeout", duree)
+    # met à jour les coches du menu
+    self.updateMnuBlackScreen()
+
+
+  @pyqtSlot()
+  def veilleEcran(self):
+    ''' Gestion de la veille écran, appelé par le timeout de self.timerVeille '''
+    if self.blackScreen.isVisible():
+      # Déjà en veille
+      return
+    dureeLimite = self.__screenSaverTimeout * 60 # timeout stocké en minutes
+    dureeInactif = time.time() - self.lastActivity
+    if dureeInactif >= dureeLimite:
+      # Black screen start
+      self.blackScreen.blackScreen_show()
+
+
+  def updateMnuBlackScreen(self):
+    ''' Coche le bon élément du menu de veille '''
+    self.ui.mnuBlackScreen1.setChecked(False)
+    self.ui.mnuBlackScreen5.setChecked(False)
+    self.ui.mnuBlackScreen20.setChecked(False)
+    self.ui.mnuBlackScreen60.setChecked(False)
+    self.ui.mnuBlackScreen120.setChecked(False)
+    self.ui.mnuBlackScreen360.setChecked(False)
+    self.ui.mnuBlackScreenOff.setChecked(False)
+    if self.__screenSaverTimeout == 1:
+      self.ui.mnuBlackScreen1.setChecked(True)
+    elif self.__screenSaverTimeout == 5:
+      self.ui.mnuBlackScreen5.setChecked(True)
+    elif self.__screenSaverTimeout == 20:
+      self.ui.mnuBlackScreen20.setChecked(True)
+    elif self.__screenSaverTimeout == 60:
+      self.ui.mnuBlackScreen60.setChecked(True)
+    elif self.__screenSaverTimeout == 120:
+      self.ui.mnuBlackScreen120.setChecked(True)
+    elif self.__screenSaverTimeout == 360:
+      self.ui.mnuBlackScreen360.setChecked(True)
+    else:
+      # self.__screenSaverTimeout == -1 ou autre valeur non prévue:
+      self.ui.mnuBlackScreenOff.setChecked(True)
 
 
   @pyqtSlot()
@@ -860,9 +1188,14 @@ class winMain(QtWidgets.QMainWindow):
 
 
   def on_dlgJogFinished(self):
-    print("dlgJog closed")
+    ''' Supression de la boite de dialogue après fermeture '''
     self.dlgJog.sig_close.disconnect(self.on_dlgJogFinished)
     self.dlgJog = None
+
+
+  def on_mnuToolChange(self):
+    ''' Appel de la boite de dialogue de changement d'outils '''
+    RC = self.__dlgToolChange.showDialog()
 
 
   @pyqtSlot()
@@ -956,6 +1289,9 @@ class winMain(QtWidgets.QMainWindow):
         self.ui.rbtMove2PointAfterXY.setChecked(self.__settings.value("Probe/go2PointXY", DEFAULT_PROBE_GO_2_POINT_AFTER_XY, type=bool))
         self.ui.rbtRetractAfterXY.setChecked(self.__settings.value("Probe/RetractAfterXY", DEFAULT_PROBE_RETRACT_AFTER_XY, type=bool))
         self.ui.dsbRetractXY.setValue(self.__settings.value("Probe/RetractDistanceXY", DEFAULT_PROBE_RETRACT_DISTANCE_AFTER_XY, type=float))
+        # case a cocher invert probe pin
+        if self.__decode.getGrblSetting(6) is not None:
+          self.ui.chkInvertProbePinXY.setChecked((int(self.__decode.getGrblSetting(6)) == 1))
 
       elif tabIndex == CN5X_TAB_PROBE_Z:
         self.ui.dsbDistanceZ.setValue(self.__settings.value("Probe/DistanceZ", DEFAULT_PROBE_DISTANCE, type=float))
@@ -971,8 +1307,12 @@ class winMain(QtWidgets.QMainWindow):
         self.ui.rbtDefineOriginZ_G54.setChecked(self.__settings.value("Probe/DefineOriginZ_G54", DEFAULT_PROBE_ORIGINE_G54_Z, type=bool))
         self.ui.rbtDefineOriginZ_G92.setChecked(self.__settings.value("Probe/DefineOriginZ_G92", DEFAULT_PROBE_ORIGINE_G92_Z, type=bool))
         self.ui.dsbOriginOffsetZ.setValue(self.__settings.value("Probe/OriginOffsetZ", DEFAULT_PROBE_ORIGINE_OFFSET_Z, type=float))
-        self.ui.dsbToolLengthSensorX.setValue(self.__settings.value("Probe/ToolSensorPositionX", DEFAULT_TOOLSENSOR_POSITION_X, type=float))
-        self.ui.dsbToolLengthSensorY.setValue(self.__settings.value("Probe/ToolSensorPositionY", DEFAULT_TOOLSENSOR_POSITION_Y, type=float))
+        self.ui.dsbToolLengthSensorZ.setValue(self.__settings.value("Probe/ToolChangePositionZ", DEFAULT_TOOLCHANGE_POSITION_Z, type=float))
+        self.ui.dsbToolLengthSensorX.setValue(self.__settings.value("Probe/ToolChangePositionX", DEFAULT_TOOLCHANGE_POSITION_X, type=float))
+        self.ui.dsbToolLengthSensorY.setValue(self.__settings.value("Probe/ToolChangePositionY", DEFAULT_TOOLCHANGE_POSITION_Y, type=float))
+        # case a cocher invert probe pin
+        if self.__decode.getGrblSetting(6) is not None:
+          self.ui.chkInvertProbePinZ.setChecked((int(self.__decode.getGrblSetting(6)) == 1))
 
 
   @pyqtSlot()
@@ -1003,6 +1343,7 @@ class winMain(QtWidgets.QMainWindow):
         self.__probeResult = self.__probe.g38(P=3, F=probeSeekRate, Z=-probeDistance, g2p=False)
         # On mémorise le résultat
         self.ui.lblLastProbZ.setText('{:+0.3f}'.format(float(self.__probeResult.getAxisByName("Z"))))
+        self.__dlgToolChange.di.lblLastProbZ.setText('{:+0.3f}'.format(float(self.__probeResult.getAxisByName("Z"))))
         # On retract d'une distance probePullOff
         retractGCode = "G0Z{:+0.3f}".format(probePullOff)
         self.__grblCom.gcodePush(retractGCode)
@@ -1029,6 +1370,7 @@ class winMain(QtWidgets.QMainWindow):
       self.__probeResult = self.__probe.g38(P=3, F=probeFeedRate, Z=-fineProbeDistance, g2p=go2point)
       # On mémorise le résultat précis
       self.ui.lblLastProbZ.setText('{:+0.3f}'.format(float(self.__probeResult.getAxisByName("Z"))))
+      self.__dlgToolChange.di.lblLastProbZ.setText('{:+0.3f}'.format(float(self.__probeResult.getAxisByName("Z"))))
 
       if self.ui.rbtRetractAfterZ.isChecked():
         # On retract d'une distance probeRetract
@@ -1061,9 +1403,9 @@ class winMain(QtWidgets.QMainWindow):
       self.__grblCom.gcodePush(oldG90_91)
 
     if (self.__probeResult is not None) and (self.__probeResult.isProbeOK()):
-      self.__initialProbeZ = True
-      if self.__initialToolLenght:
-        self.calculateToolOffset()
+      self.__dlgToolChange.setInitialProbeZ(True)
+      if self.__dlgToolChange.initialToolLenght():
+        self.__dlgToolChange.calculateToolOffset()
 
     # Pour finir, on sauvegarde les derniers paramètres de probe dans les settings
     self.__settings.setValue("Probe/DistanceZ", self.ui.dsbDistanceZ.value())
@@ -1078,16 +1420,40 @@ class winMain(QtWidgets.QMainWindow):
 
 
   @pyqtSlot()
-  def on_btnGoToSensor(self):
-    ''' Déplacement vers les coordonnées machine X, Y du palpeur de longueur d'outil'''
-    # Recupération des coordonnées X & Y du point
+  def on_btnSaveToolChangePosition(self):
+    '''
+    Déplacement rapide du palpeur de longueur d'outil vers les coordonnées machine :
+    Z d'abord pour dégager, puis X, Y.
+    '''
+    # Recupération des coordonnées Z, X & Y du point
+    posZ = self.ui.dsbToolLengthSensorZ.value()
     posX = self.ui.dsbToolLengthSensorX.value()
     posY = self.ui.dsbToolLengthSensorY.value()
-    deplacementGCode = "G53G0X{}Y{}".format(posX, posY)
-    self.__grblCom.gcodePush(deplacementGCode)
     # Memorise la position dans les settings
-    self.__settings.setValue("Probe/ToolSensorPositionX", posX)
-    self.__settings.setValue("Probe/ToolSensorPositionY", posY)
+    self.__settings.setValue("Probe/ToolChangePositionZ", posZ)
+    self.__settings.setValue("Probe/ToolChangePositionX", posX)
+    self.__settings.setValue("Probe/ToolChangePositionY", posY)
+
+
+  @pyqtSlot()
+  def on_btnGoToSensor(self):
+    '''
+    Déplacement rapide du palpeur de longueur d'outil vers les coordonnées machine :
+    Z d'abord pour dégager, puis X, Y.
+    '''
+    # Recupération des coordonnées Z, X & Y du point
+    posZ = self.ui.dsbToolLengthSensorZ.value()
+    posX = self.ui.dsbToolLengthSensorX.value()
+    posY = self.ui.dsbToolLengthSensorY.value()
+    # Effectue les déplacements
+    deplacementGCodeZ  = "G53G0Z{}".format(posZ)
+    deplacementGCodeXY = "G53G0X{}Y{}".format(posX, posY)
+    self.__grblCom.gcodePush(deplacementGCodeZ)
+    self.__grblCom.gcodePush(deplacementGCodeXY)
+    # Memorise la position dans les settings
+    self.__settings.setValue("Probe/ToolChangePositionZ", posZ)
+    self.__settings.setValue("Probe/ToolChangePositionX", posX)
+    self.__settings.setValue("Probe/ToolChangePositionY", posY)
 
 
   @pyqtSlot()
@@ -1096,7 +1462,7 @@ class winMain(QtWidgets.QMainWindow):
     Mémorise le Z du point de contact initial de l'outil pour calculer les outils suivants
     et envoi G49 pour réinitialiser une éventuelle longueur précédente.
     '''
-    if not self.__initialProbeZ:
+    '''if not self.__dlgToolChange.__initialProbeZ:
       self.log(logSeverity.error.value, self.tr("on_btnG49(): No initial Z probe result, can't get initial tool length probe!"))
       m = msgBox(
                   title  = self.tr("Error !"),
@@ -1111,10 +1477,12 @@ class winMain(QtWidgets.QMainWindow):
     
     # Initialise la longueur d'outil initiale
     self.ui.lblInitToolLength.setText(self.ui.lblLastProbZ.text())
+    self.__dlgToolChange.di.lblInitToolLength.setText(self.__dlgToolChange.di.lblLastProbZ.text())
     self.__grblCom.gcodePush("G49")
 
-    self.__initialToolLenght = True
-
+    self.__dlgToolChange.__initialToolLenght = True
+    '''
+    self.__dlgToolChange.on_btnG49()
 
   @pyqtSlot()
   def on_btnG43_1(self):
@@ -1122,7 +1490,7 @@ class winMain(QtWidgets.QMainWindow):
     Calcul de la correction de longueur d'outil par rapport à la valeur initiale mémorisée
     et configure le "Tool Length Offset" dans Grbl à l'aide de G43.1
     '''
-    if not self.__initialToolLenght:
+    '''if not self.__dlgToolChange.__initialToolLenght:
       self.log(logSeverity.error.value, self.tr("on_btnG43_1(): No initial tool length, can't calculate length offset!"))
       m = msgBox(
                   title  = self.tr("Error !"),
@@ -1135,9 +1503,11 @@ class winMain(QtWidgets.QMainWindow):
       m.afficheMsg()
       return
     # Envoi de la correction de longueur d'outil
-    toolOffset = self.calculateToolOffset()
+    toolOffset = self.__dlgToolChange.calculateToolOffset()
     toolOffsetGcode = "G43.1Z{}".format(toolOffset)
     self.__grblCom.gcodePush(toolOffsetGcode)
+    '''
+    self.__dlgToolChange.on_btnG43_1()
 
 
   @pyqtSlot()
@@ -1596,13 +1966,13 @@ class winMain(QtWidgets.QMainWindow):
         # Probe en X+ / X-
         self.__grblCom.gcodePush("G0X{:+0.3f}".format(-probeDistance - clearanceXY - (toolDiameter/2)))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(-clearanceZ))
-        probeXplus(clearanceXY + toolDiameter)
+        probeXplus((clearanceXY * 2) + toolDiameter)
         time.sleep(0.25)
         self.__grblCom.gcodePush("G0X{:+0.3f}".format(-clearanceXY))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(clearanceZ))
         self.__grblCom.gcodePush("G0X{:+0.3f}".format(2 * (probeDistance + clearanceXY) + toolDiameter))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(-clearanceZ))
-        probeXmoins(clearanceXY + toolDiameter)
+        probeXmoins((clearanceXY * 2) + toolDiameter)
         time.sleep(0.25)
         self.__grblCom.gcodePush("G0X{:+0.3f}".format(clearanceXY))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(clearanceZ))
@@ -1612,13 +1982,13 @@ class winMain(QtWidgets.QMainWindow):
         # Probe en Y+ / Y-
         self.__grblCom.gcodePush("G0Y{:+0.3f}".format(-probeDistance - clearanceXY - (toolDiameter/2)))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(-clearanceZ))
-        probeYplus(clearanceXY + toolDiameter)
+        probeYplus((clearanceXY * 2) + toolDiameter)
         time.sleep(0.25)
         self.__grblCom.gcodePush("G0Y{:+0.3f}".format(-clearanceXY))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(clearanceZ))
         self.__grblCom.gcodePush("G0Y{:+0.3f}".format(2 * (probeDistance + clearanceXY) + toolDiameter))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(-clearanceZ))
-        probeYmoins(clearanceXY + toolDiameter)
+        probeYmoins((clearanceXY * 2) + toolDiameter)
         time.sleep(0.25)
         self.__grblCom.gcodePush("G0Y{:+0.3f}".format(clearanceXY))
         self.__grblCom.gcodePush("G0Z{:+0.3f}".format(clearanceZ))
@@ -1790,13 +2160,23 @@ class winMain(QtWidgets.QMainWindow):
 
 
   @pyqtSlot()
-  def calculateToolOffset(self):
-    # Traitement de la correction de longueur d'outil.
-    lastProbe         = float(self.ui.lblLastProbZ.text().replace(' ', ''))
-    initialToolLength = float(self.ui.lblInitToolLength.text().replace(' ', ''))
-    toolOffset = lastProbe - initialToolLength
-    self.ui.lblToolOffset.setText('{:+0.3f}'.format(toolOffset))
-    return toolOffset
+  def on_chkInvertProbePinZ(self):
+    if self.ui.chkInvertProbePinZ.isChecked():
+      self.__grblCom.gcodePush("$6=1")
+      self.__grblCom.gcodePush(CMD_GRBL_GET_SETTINGS)
+    else:
+      self.__grblCom.gcodePush("$6=0")
+      self.__grblCom.gcodePush(CMD_GRBL_GET_SETTINGS)
+
+
+  @pyqtSlot()
+  def on_chkInvertProbePinXY(self):
+    if self.ui.chkInvertProbePinXY.isChecked():
+      self.__grblCom.gcodePush("$6=1")
+      self.__grblCom.gcodePush(CMD_GRBL_GET_SETTINGS)
+    else:
+      self.__grblCom.gcodePush("$6=0")
+      self.__grblCom.gcodePush(CMD_GRBL_GET_SETTINGS)
 
 
   @pyqtSlot(str)
@@ -1867,7 +2247,7 @@ class winMain(QtWidgets.QMainWindow):
       self.ui.lblSerialLock.setStyleSheet(".QLabel{border-radius: 3px; background: green;}")
       self.ui.lblSerialActivity.setStyleSheet(".QLabel{border-radius: 3px; background: green;}")
       # Beep
-      self.__beeper.beep(1760, 0.25, 16000)
+      self.__beeper.beep(0.5) #(1760, 0.25, 16000)
 
     else:
       # Mise a jour de l'interface machine non connectée
@@ -1904,10 +2284,15 @@ class winMain(QtWidgets.QMainWindow):
 
   @pyqtSlot()
   def on_btnLinkOverride(self):
-    if self.ui.btnLinkOverride.isChecked() and (self.ui.dialAvance.value() != self.ui.dialBroche.value()):
-      newValue = (self.ui.dialAvance.value() + self.ui.dialBroche.value()) / 2
-      self.ui.dialBroche.setValue(newValue)
-      self.ui.dialAvance.setValue(newValue)
+    if (self.ui.btnLinkOverride.isChecked()):
+      self.ui.btnLinkOverride.setIcon(self.iconLinkOn)
+      if (self.ui.dialAvance.value() != self.ui.dialBroche.value()):
+        # On force comme valeur la moyenne des 2
+        newValue = int((self.ui.dialAvance.value() + self.ui.dialBroche.value()) / 2)
+        self.ui.dialBroche.setValue(newValue)
+        self.ui.dialAvance.setValue(newValue)
+    else: # Bouton non checked
+      self.ui.btnLinkOverride.setIcon(self.iconLinkOff)
 
 
   @pyqtSlot()
@@ -2043,6 +2428,20 @@ class winMain(QtWidgets.QMainWindow):
 
 
   @pyqtSlot()
+  def showKeyboard(self):
+    if not self.qwKeyboard.isKeyboardVisible():
+      self.qwKeyboard.keyboard_show()
+      self.ui.txtGCode.setFocus()
+      self.ui.txtGCode.selectAll()
+      self.ui.btnKeyboard.setText("⇩⌨⇩")
+    else:
+      self.qwKeyboard.keyboard_hide()
+      self.ui.txtGCode.setFocus()
+      self.ui.txtGCode.selectAll()
+      self.ui.btnKeyboard.setText("⇧⌨⇧")
+
+
+  @pyqtSlot()
   def sendCmd(self):
     if self.ui.txtGCode.text() != "":
       if self.ui.txtGCode.text() == REAL_TIME_REPORT_QUERY:
@@ -2080,12 +2479,12 @@ class winMain(QtWidgets.QMainWindow):
   @pyqtSlot(QtGui.QKeyEvent)
   def on_keyPressed(self, e):
     key = e.key()
-    if QKeySequence(key+int(e.modifiers())) == QKeySequence("Ctrl+C"):
+    if (e.modifiers() == Qt.KeyboardModifier.ControlModifier) and (key == Qt.Key.Key_C):
       pass
-    elif QKeySequence(key+int(e.modifiers())) == QKeySequence("Ctrl+X"):
+    elif (e.modifiers() == Qt.KeyboardModifier.ControlModifier) and (key == Qt.Key.Key_X):
       self.logGrbl.append("Ctrl+X")
       self.__grblCom.realTimePush(REAL_TIME_SOFT_RESET) # Envoi Ctrl+X.
-    elif key == Qt.Key_Up:
+    elif key == Qt.Key.Key_Up:
       # Rappel des dernières commandes GCode
       if len(self.__gcodes_stack) > 0:
         if self.__gcode_current_txt == "":
@@ -2097,7 +2496,7 @@ class winMain(QtWidgets.QMainWindow):
           self.ui.txtGCode.setSelection(0,len(self.ui.txtGCode.text()))
         elif self.__gcodes_stack_pos >= len(self.__gcodes_stack):
           self.__gcodes_stack_pos = len(self.__gcodes_stack) - 1
-    elif key == Qt.Key_Down:
+    elif key == Qt.Key.Key_Down:
       # Rappel des dernières commandes GCode
       if len(self.__gcodes_stack) > 0:
         self.__gcodes_stack_pos -= 1
@@ -2125,8 +2524,11 @@ class winMain(QtWidgets.QMainWindow):
       self.logCn5X.append(time.strftime("%Y-%m-%d %H:%M:%S") + " : Error   : " + data)
       if not self.ui.btnDebug.isChecked():
         self.ui.qtabConsole.setCurrentIndex(CN5X_TAB_LOG)
+
+
   def log(self, severity: int, data: str):
     self.on_sig_log(severity, data)
+
 
   @pyqtSlot(str)
   def on_sig_init(self, data: str):
@@ -2155,8 +2557,11 @@ class winMain(QtWidgets.QMainWindow):
       self.__cycleRun = False
       self.__cyclePause = False
       # Masque de la boite de progression
-    if self.__pBox.isVisible():
-      self.__pBox.stop()
+      if self.__pBox.isVisible():
+        if self.__pBox.autoClose():
+          self.__pBox.stop()
+        else:
+          self.__pBox.enableClose()
 
 
   @pyqtSlot(int)
@@ -2167,9 +2572,12 @@ class winMain(QtWidgets.QMainWindow):
       self.__grblCom.clearCom() # Vide la file d'attente de communication
       self.__cycleRun = False
       self.__cyclePause = False
-    # Masque de la boite de progression
-    if self.__pBox.isVisible():
-      self.__pBox.stop()
+      # Masque de la boite de progression
+      if self.__pBox.isVisible():
+        if self.__pBox.autoClose():
+          self.__pBox.stop()
+        else:
+          self.__pBox.enableClose()
 
 
   @pyqtSlot(str)
@@ -2177,12 +2585,6 @@ class winMain(QtWidgets.QMainWindow):
     retour = self.__decode.decodeGrblStatus(data)
     if retour != "":
       self.logGrbl.append(retour)
-    if self.__cycleRun and self.__decode.get_etatMachine() == GRBL_STATUS_RUN:
-      self.__pBoxArmee = True
-    # Masque de la boite de progression
-    if (self.__decode.get_etatMachine() == GRBL_STATUS_IDLE) and self.__pBox.isVisible() and self.__pBoxArmee:
-      #print(self.__decode.get_etatMachine())
-      self.__pBox.stop()
 
 
   @pyqtSlot(str)
@@ -2198,14 +2600,15 @@ class winMain(QtWidgets.QMainWindow):
     if data[:5] == "[AXS:":
       self.__nbAxis           = int(data[1:-1].split(':')[1])
       self.__axisNames        = list(data[1:-1].split(':')[2])
+      # Mise à jour classe grblProbe
+      self.__probe.setAxisNames(self.__axisNames)
+      # Mise à jour classe dlgToolChange
+      self.__dlgToolChange.setAxisNumber(self.__nbAxis)
+      self.__dlgToolChange.setAxisNames(self.__axisNames)
       if len(self.__axisNames) < self.__nbAxis:
         # Il est posible qu'il y ait moins de lettres que le nombre d'axes si Grbl
         # implémente l'option REPORT_VALUE_FOR_AXIS_NAME_ONCE
         self.__nbAxis = len(self.__axisNames);
-      '''self.updateAxisNumber()
-      self.__decode.setNbAxis(self.__nbAxis)'''
-      # Mise à jour classe grblProbe
-      self.__probe.setAxisNames(self.__axisNames)
       
     # Memorise les courses maxi pour calcul des jogs max.
     elif data[:4] == "$130":
@@ -2231,6 +2634,7 @@ class winMain(QtWidgets.QMainWindow):
 
   @pyqtSlot(str)
   def on_sig_emit(self, data: str):
+    trouve = False
     if data != "":
       self.logGrbl.append(data)
       if self.__cycleRun:
@@ -2240,14 +2644,16 @@ class winMain(QtWidgets.QMainWindow):
           idx = self.ui.gcodeTable.model().index(ligne, 0, QModelIndex())
           if self.ui.gcodeTable.model().data(idx) == data:
             self.__gcodeFile.selectGCodeFileLine(ligne)
+            trouve = True
             break
           else:
             ligne += 1
         # Mise à jour de la progressBox
-        self.__pBox.setValue(ligne + 1)
+        if trouve:
+          self.__pBox.setValue(ligne + 1)
+        # On affiche le dernier commentaire rencontré dans la progressBox
         if data[:1] == '(' and data[-1:] == ")":
           self.__pBox.setComment(data)
-
 
   @pyqtSlot(str)
   def on_sig_recu(self, data: str):
@@ -2294,7 +2700,7 @@ class winMain(QtWidgets.QMainWindow):
   def on_mnuA_propos(self):
     ''' Appel de la boite de dialogue A Propos
     '''
-    dlgApropos = cn5XAPropos(self.tr("Version {}.{}").format(APP_VERSION_STRING, APP_VERSION_DATE), self.__licenceFile)
+    dlgApropos = cn5XAPropos(self.tr("cn5X++ version {}.{}").format(APP_VERSION_STRING, APP_VERSION_DATE), self.__licenceFile)
     dlgApropos.setParent(self)
     dlgApropos.showDialog()
 
@@ -2332,27 +2738,46 @@ class winMain(QtWidgets.QMainWindow):
 
 
   def startCycle(self, startFrom: int = 0):
-    
 
     if self.ui.gcodeTable.model().rowCount()<=0:
       self.log(logSeverity.warning.value, self.tr("Attempt to start an empty cycle..."))
+    elif self.__cycleRun:
+      self.log(logSeverity.warning.value, self.tr("Cycle already running!"))
     else:
       self.log(logSeverity.info.value, self.tr("Starting cycle..."))
 
       # Affichage de la boite de progression
       self.__pBox.setRange(startFrom, self.ui.gcodeTable.model().rowCount())
-      self.__pBoxArmee = False
       self.__pBox.start()
 
       self.__gcodeFile.selectGCodeFileLine(0)
       self.__cycleRun = True
       self.__cyclePause = False
-      
+
       self.__gcodeFile.enQueue(self.__grblCom, startFrom)
-      
-      self.ui.btnStart.setButtonStatus(True)
+
+      # Attente du début du traitement par Grbl
+      while self.__decode.get_etatMachine() != GRBL_STATUS_RUN:
+        QCoreApplication.processEvents()
+      # Attente de la fin du traitement par Grbl
+      while self.__decode.get_etatMachine() != GRBL_STATUS_IDLE:
+        QCoreApplication.processEvents()
+
+      self.log(logSeverity.info.value, self.tr("Cycle completed."))
+
+      self.__pBox.setComment(self.tr("GCode finished at: {}").format(datetime.now().strftime("%A %x %H:%M:%S")))
+
+      self.ui.btnStart.setButtonStatus(False)
       self.ui.btnPause.setButtonStatus(False)
-      self.ui.btnStop.setButtonStatus(False)
+      self.ui.btnStop.setButtonStatus(True)
+      
+      self.__cycleRun = False
+
+      if self.__pBox.isVisible():
+        if self.__pBox.autoClose():
+          self.__pBox.stop()
+        else:
+          self.__pBox.enableClose()
 
 
   def pauseCycle(self):
@@ -2403,34 +2828,38 @@ class winMain(QtWidgets.QMainWindow):
     self.__cycleRun = False
     self.__cyclePause = False
     # Masque de la boite de progression
-    self.__pBox.stop()
+    if self.__pBox.isVisible():
+      if self.__pBox.autoClose():
+        self.__pBox.stop()
+      else:
+        self.__pBox.enableClose()
     self.ui.btnStart.setButtonStatus(False)
     self.ui.btnPause.setButtonStatus(False)
     self.ui.btnStop.setButtonStatus(True)
-    self.log(logSeverity.info.value, self.tr("Cycle completed."))
+    self.log(logSeverity.info.value, self.tr("Cycle stopped."))
 
 
   def on_gcodeTableContextMenu(self, event):
     if self.__gcodeFile.isFileLoaded():
       self.cMenu = QtWidgets.QMenu(self)
-      editAction = QtWidgets.QAction(self.tr("Edit line"), self)
+      editAction = QAction(self.tr("Edit line"), self)
       editAction.triggered.connect(lambda: self.editGCodeSlot(event))
       self.cMenu.addAction(editAction)
-      insertAction = QtWidgets.QAction(self.tr("Insert line"), self)
+      insertAction = QAction(self.tr("Insert line"), self)
       insertAction.triggered.connect(lambda: self.insertGCodeSlot(event))
       self.cMenu.addAction(insertAction)
-      ajoutAction = QtWidgets.QAction(self.tr("Add line"), self)
+      ajoutAction = QAction(self.tr("Add line"), self)
       ajoutAction.triggered.connect(lambda: self.ajoutGCodeSlot(event))
       self.cMenu.addAction(ajoutAction)
-      supprimeAction = QtWidgets.QAction(self.tr("Suppress line"), self)
+      supprimeAction = QAction(self.tr("Suppress line"), self)
       supprimeAction.triggered.connect(lambda: self.supprimeGCodeSlot(event))
       self.cMenu.addAction(supprimeAction)
       self.cMenu.addSeparator()
-      runAction = QtWidgets.QAction(self.tr("Run this line\t(F7)"), self)
+      runAction = QAction(self.tr("Run this line\t(F7)"), self)
       runAction.setShortcut('F7')
       runAction.triggered.connect(lambda: self.runGCodeSlot(event))
       self.cMenu.addAction(runAction)
-      startFromHereAction = QtWidgets.QAction(self.tr("Run from this line\t(F8)"), self)
+      startFromHereAction = QAction(self.tr("Run from this line\t(F8)"), self)
       startFromHereAction.setShortcut('F8')
       startFromHereAction.triggered.connect(lambda: self.startFromGCodeSlotIndex(event))
       self.cMenu.addAction(startFromHereAction)
@@ -2474,7 +2903,7 @@ class winMain(QtWidgets.QMainWindow):
     self.startCycle(idx[0].row())
 
 
-  @pyqtSlot() #QtGui.QKeyEvent)
+  @pyqtSlot()
   def on_GCodeTable_key_F7_Pressed(self):
     if self.ui.gcodeTable.hasFocus() and self.__gcodeFile.isFileLoaded():
       idx = self.ui.gcodeTable.selectionModel().selectedIndexes()
@@ -2490,7 +2919,7 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_dialAvanceContextMenu(self):
     self.cMenu = QtWidgets.QMenu(self)
-    resetAction = QtWidgets.QAction(self.tr("Reset feedrate to 100%"), self)
+    resetAction = QAction(self.tr("Reset feedrate to 100%"), self)
     resetAction.triggered.connect(lambda: self.ui.dialAvance.setValue(100))
     self.cMenu.addAction(resetAction)
     self.cMenu.popup(QtGui.QCursor.pos())
@@ -2498,7 +2927,7 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_dialBrocheContextMenu(self):
     self.cMenu = QtWidgets.QMenu(self)
-    resetAction = QtWidgets.QAction(self.tr("Reset spindle speed to 100%"), self)
+    resetAction = QAction(self.tr("Reset spindle speed to 100%"), self)
     resetAction.triggered.connect(lambda: self.ui.dialBroche.setValue(100))
     self.cMenu.addAction(resetAction)
     self.cMenu.popup(QtGui.QCursor.pos())
@@ -2506,10 +2935,10 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_lblPosContextMenu(self, axis: str):
     self.cMenu = QtWidgets.QMenu(self)
-    resetX = QtWidgets.QAction(self.tr("Place the {} origin of axis {} here").format(self.__decode.getG5actif(), self.__axisNames[axis]), self)
+    resetX = QAction(self.tr("Place the {} origin of axis {} here").format(self.__decode.getG5actif(), self.__axisNames[axis]), self)
     resetX.triggered.connect(lambda: self.__grblCom.gcodePush("G10P0L20{}0".format(self.__axisNames[axis])))
     self.cMenu.addAction(resetX)
-    resetAll = QtWidgets.QAction(self.tr("Place the {} origin of all axis here").format(self.__decode.getG5actif()), self)
+    resetAll = QAction(self.tr("Place the {} origin of all axis here").format(self.__decode.getG5actif()), self)
     axesTraites = []
     gcodeString = "G10P0L20"
     for a in self.__axisNames:
@@ -2519,11 +2948,11 @@ class winMain(QtWidgets.QMainWindow):
     resetAll.triggered.connect(lambda: self.__grblCom.gcodePush(gcodeString))
     self.cMenu.addAction(resetAll)
     self.cMenu.addSeparator()
-    resetX = QtWidgets.QAction(self.tr("Jog axis {} to {} origin").format(self.__axisNames[axis], self.__decode.getG5actif()), self)
+    resetX = QAction(self.tr("Jog axis {} to {} origin").format(self.__axisNames[axis], self.__decode.getG5actif()), self)
     cmdJog1 = CMD_GRBL_JOG + "G90G21F{}{}0".format(self.ui.dsbJogSpeed.value(), self.__axisNames[axis])
     resetX.triggered.connect(lambda: self.__grblCom.gcodePush(cmdJog1))
     self.cMenu.addAction(resetX)
-    resetAll = QtWidgets.QAction(self.tr("Jog all axis to {} origin").format(self.__decode.getG5actif()), self)
+    resetAll = QAction(self.tr("Jog all axis to {} origin").format(self.__decode.getG5actif()), self)
     axesTraites = []
     cmdJog = CMD_GRBL_JOG + "G90G21F{}".format(self.ui.dsbJogSpeed.value())
     for a in self.__axisNames:
@@ -2537,17 +2966,17 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_lblGXXContextMenu(self, piece: int):
     self.cMenu = QtWidgets.QMenu(self)
-    setOrigineAll = QtWidgets.QAction(self.tr("Place the workpiece origin {} (G{})").format(str(piece), str(piece + 53)), self)
+    setOrigineAll = QAction(self.tr("Place the workpiece origin {} (G{})").format(str(piece), str(piece + 53)), self)
 
   def on_lblPlanContextMenu(self):
     self.cMenu = QtWidgets.QMenu(self)
-    planXY = QtWidgets.QAction(self.tr("G17 Working plane - XY (Defaut)"), self)
+    planXY = QAction(self.tr("G17 Working plane - XY (Defaut)"), self)
     planXY.triggered.connect(lambda: self.__grblCom.gcodePush("G17"))
     self.cMenu.addAction(planXY)
-    planXZ = QtWidgets.QAction(self.tr("G18 Working plane - XZ"), self)
+    planXZ = QAction(self.tr("G18 Working plane - XZ"), self)
     planXZ.triggered.connect(lambda: self.__grblCom.gcodePush("G18"))
     self.cMenu.addAction(planXZ)
-    planYZ = QtWidgets.QAction(self.tr("G19 Working plane - YZ"), self)
+    planYZ = QAction(self.tr("G19 Working plane - YZ"), self)
     planYZ.triggered.connect(lambda: self.__grblCom.gcodePush("G19"))
     self.cMenu.addAction(planYZ)
     self.cMenu.popup(QtGui.QCursor.pos())
@@ -2555,10 +2984,10 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_lblUnitesContextMenu(self):
     self.cMenu = QtWidgets.QMenu(self)
-    unitePouces = QtWidgets.QAction(self.tr("G20 - Work units in inches"), self)
+    unitePouces = QAction(self.tr("G20 - Work units in inches"), self)
     unitePouces.triggered.connect(lambda: self.__grblCom.gcodePush("G20"))
     self.cMenu.addAction(unitePouces)
-    uniteMM = QtWidgets.QAction(self.tr("G21 - Work units in millimeters"), self)
+    uniteMM = QAction(self.tr("G21 - Work units in millimeters"), self)
     uniteMM.triggered.connect(lambda: self.__grblCom.gcodePush("G21"))
     self.cMenu.addAction(uniteMM)
     self.cMenu.popup(QtGui.QCursor.pos())
@@ -2566,10 +2995,10 @@ class winMain(QtWidgets.QMainWindow):
 
   def on_lblCoordContextMenu(self):
     self.cMenu = QtWidgets.QMenu(self)
-    unitePouces = QtWidgets.QAction(self.tr("G90 - Absolute coordinates movements"), self)
+    unitePouces = QAction(self.tr("G90 - Absolute coordinates movements"), self)
     unitePouces.triggered.connect(lambda: self.__grblCom.gcodePush("G90"))
     self.cMenu.addAction(unitePouces)
-    uniteMM = QtWidgets.QAction(self.tr("G91 - relative coordinates movements"), self)
+    uniteMM = QAction(self.tr("G91 - relative coordinates movements"), self)
     uniteMM.triggered.connect(lambda: self.__grblCom.gcodePush("G91"))
     self.cMenu.addAction(uniteMM)
     self.cMenu.popup(QtGui.QCursor.pos())
@@ -2578,7 +3007,13 @@ class winMain(QtWidgets.QMainWindow):
   def createLangMenu(self):
     ''' Creation du menu de choix de la langue du programme
     en fonction du contenu du fichier i18n/cn5X_locales.xml '''
-    document = parse("{}/i18n/cn5X_locales.xml".format(app_path))
+    fichierXML = QFile(os.path.join(os.path.dirname(__file__), "i18n/cn5X_locales.xml"))
+    if fichierXML.open(QIODevice.OpenModeFlag.ReadOnly):
+      XMLbuff = str(fichierXML.readAll(), 'utf-8')
+    else:
+      print("Error reading cn5X_locales.xml from resources !")
+
+    document = parseString(XMLbuff)
     root = document.documentElement
     translations = root.getElementsByTagName("translation")
 
@@ -2591,22 +3026,28 @@ class winMain(QtWidgets.QMainWindow):
       self.langues.append(translation.getElementsByTagName("locale")[0].childNodes[0].nodeValue)
       label = translation.getElementsByTagName("label")[0].childNodes[0].nodeValue
       qm_file = translation.getElementsByTagName("qm_file")[0].childNodes[0].nodeValue
-      flag_file = translation.getElementsByTagName("flag_file")[0].childNodes[0].nodeValue
+      flag_file = os.path.join(os.path.dirname(__file__), translation.getElementsByTagName("flag_file")[0].childNodes[0].nodeValue)
 
-      self.ui.actionLang.append(QtWidgets.QAction(self))
+      self.ui.actionLang.append(QAction(self))
       self.ui.iconLang.append(QtGui.QIcon())
-      self.ui.iconLang[l].addPixmap(QtGui.QPixmap(flag_file), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+      self.ui.iconLang[l].addPixmap(QtGui.QPixmap(flag_file), QtGui.QIcon.Mode.Normal, QtGui.QIcon.State.On)
       self.ui.actionLang[l].setIcon(self.ui.iconLang[l])
       self.ui.actionLang[l].setText(label)
       self.ui.actionLang[l].setCheckable(True)
+      font = QtGui.QFont()
+      font.setPointSize(12)
+      self.ui.actionLang[l].setFont(font)
       self.ui.actionLang[l].setObjectName(self.langues[l])
       self.ui.menuLangue.addAction(self.ui.actionLang[l])
 
       l += 1
 
     self.ui.menuLangue.addSeparator()
-    self.actionLangSystem = QtWidgets.QAction()
+    self.actionLangSystem = QAction()
     self.actionLangSystem.setCheckable(True)
+    font = QtGui.QFont()
+    font.setPointSize(12)
+    self.actionLangSystem.setFont(font)
     self.actionLangSystem.setObjectName("actionLangSystem")
     self.ui.menuLangue.addAction(self.actionLangSystem)
     self.actionLangSystem.setText(self.tr("Use system language"))
@@ -2653,15 +3094,15 @@ class winMain(QtWidgets.QMainWindow):
   def setTranslator(self, langue: QLocale):
     ''' Active la langue de l'interface '''
     global translator # Reutilise le translateur de l'objet app
-    if not translator.load(langue, "{}/i18n/cn5X".format(app_path), "."):
+    if not translator.load(langue, os.path.join(os.path.dirname(__file__), "i18n/cn5X"), "."):
       self.log(logSeverity.error.value, self.tr("Locale ({}) not usable, using default to english").format(langue.name()))
-      #langue = QLocale(QLocale.French, QLocale.France)
-      langue = QLocale(QLocale.English, QLocale.UnitedKingdom)
-      translator.load(langue, "{}/i18n/cn5X".format(app_path), ".")
+      #langue = QLocale(QLocale.Language.French, QLocale.Country.France)
+      langue = QLocale(QLocale.Language.English, QLocale.Country.UnitedKingdom)
+      translator.load(langue, os.path.join(os.path.dirname(__file__), "i18n/cn5X"), ".")
 
     # Install le traducteur et l'exécute sur les éléments déjà chargés
-    QtCore.QCoreApplication.installTranslator(translator)
-    self.ui.retranslateUi(self)
+    QCoreApplication.installTranslator(translator)
+    ######self.ui.retranslateUi(self)
     self.actionLangSystem.setText(self.tr("Use system language"))
 
     # Coche le bon item dans le menu langue
@@ -2684,12 +3125,12 @@ class winMain(QtWidgets.QMainWindow):
           a.setChecked(False)
 
     # Sélectionne l'image du bouton d'urgence
-    if langue.language() == QLocale(QLocale.French, QLocale.France).language():
-      self.btnUrgencePictureLocale = ":/cn5X/images/btnUrgence.svg"
-      self.btnUrgenceOffPictureLocale = ":/cn5X/images/btnUrgenceOff.svg"
+    if langue.language() == QLocale(QLocale.Language.French, QLocale.Country.France).language():
+      self.btnUrgencePictureLocale = os.path.join(os.path.dirname(__file__), "images/btnUrgence.svg")
+      self.btnUrgenceOffPictureLocale = os.path.join(os.path.dirname(__file__), "images/btnUrgenceOff.svg")
     else:
-      self.btnUrgencePictureLocale = ":/cn5X/images/btnEmergency.svg"
-      self.btnUrgenceOffPictureLocale = ":/cn5X/images/btnEmergencyOff.svg"
+      self.btnUrgencePictureLocale = os.path.join(os.path.dirname(__file__), "images/btnEmergency.svg")
+      self.btnUrgenceOffPictureLocale = os.path.join(os.path.dirname(__file__), "images/btnEmergencyOff.svg")
     # et relance l'affichage avec la nouvelle image
     self.setEnableDisableGroupes()
 
@@ -2711,9 +3152,9 @@ if __name__ == '__main__':
   else:
     # unfrozen
     app_path = os.path.dirname(os.path.realpath(__file__))
-  print("{} v{}.{} running from: {}".format(APP_NAME, APP_VERSION_STRING, APP_VERSION_DATE, app_path))
 
   # Bannière sur la console...
+  print("{} v{}.{} running from: {}".format(APP_NAME, APP_VERSION_STRING, APP_VERSION_DATE, app_path))
   print("")
   print("                ####### #     #")
   print("  ####   #    # #        #   #     #       #")
@@ -2724,14 +3165,16 @@ if __name__ == '__main__':
   print("  ####   #    #  #####  #     #")
   print("")
 
-  translator = QTranslator()
-  langue = QLocale(QLocale.French, QLocale.France)
-  translator.load(langue, "{}/i18n/cn5X".format(app_path), ".")
-  app.installTranslator(translator)
-
   # Chargement police LED Calculator depuis le fichier de ressources
-  QFontDatabase.addApplicationFont(":/cn5X/fonts/LEDCalculator.ttf")
+  QFontDatabase.addApplicationFont(os.path.join(os.path.dirname(__file__), "fonts/LEDCalculator.ttf"))
+  QFontDatabase.addApplicationFont(os.path.join(os.path.dirname(__file__), "fonts/DSEG14Classic.ttf"))
+  QFontDatabase.addApplicationFont(os.path.join(os.path.dirname(__file__), "fonts/DSEG14ClassicMini.ttf"))
 
+  translator = QTranslator()
+  langue = QLocale(QLocale.Language.French, QLocale.Country.France)
+  translator.load(langue, os.path.join(os.path.dirname(__file__), "i18n/cn5X"), ".")
+  app.installTranslator(translator)
+  
   # Définition de la locale pour affichage des dates dans la langue du systeme
   try:
     locale.setlocale(locale.LC_TIME, '')
@@ -2739,5 +3182,12 @@ if __name__ == '__main__':
     print("Warning: {}".format(err))
 
   window = winMain()
+
+  # Traque tous les évennements de l'appli pour gestion de la veille en
+  # mode plein écran
+  appEvents = appEventFilter(win=window)
+  app.installEventFilter(appEvents)
+  derniereActivite = time.time()
+  
   window.show()
-  sys.exit(app.exec_())
+  sys.exit(app.exec())

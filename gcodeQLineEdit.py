@@ -2,7 +2,7 @@
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
-' Copyright 2018-2022 Gauthier Brière (gauthier.briere "at" gmail.com)    '
+' Copyright 2018-2024 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
 ' This file is part of cn5X++                                             '
 '                                                                         '
@@ -21,17 +21,21 @@
 '                                                                         '
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import pyqtSignal
+
 
 class gcodeQLineEdit(QtWidgets.QLineEdit):
+  ''' QlineEdit avec ajout de l'envoi d'evennement KeyPressed
   '''
-  QlineEdit avec ajout de l'evennement KeyPressed
-  '''
-  keyPressed = QtCore.pyqtSignal(QtGui.QKeyEvent)
+  keyPressed = pyqtSignal(QtGui.QKeyEvent)
+
 
   def __init__(self, parent=None):
-    QtWidgets.QLineEdit.__init__(self, parent)
+    super().__init__(parent)
+
 
   def keyPressEvent(self, event):
-    super(gcodeQLineEdit, self).keyPressEvent(event)
     self.keyPressed.emit(event)
+    return super().keyPressEvent(event)
+

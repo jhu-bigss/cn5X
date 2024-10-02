@@ -2,9 +2,9 @@
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
-' Copyright 2018-2022 Gauthier Brière (gauthier.briere "at" gmail.com)    '
+' Copyright 2018-2024 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
-' This file is part of cn5X++                                             '
+' This file: cn5X_gcodeFile.py is part of cn5X++                          '
 '                                                                         '
 ' cn5X++ is free software: you can redistribute it and/or modify it       '
 '  under the terms of the GNU General Public License as published by      '
@@ -23,14 +23,15 @@
 
 import os, sys
 from datetime import datetime
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QCoreApplication, QObject, pyqtSignal, pyqtSlot, QModelIndex, QItemSelectionModel
-from PyQt5.QtGui import QKeySequence, QStandardItemModel, QStandardItem
-from PyQt5.QtWidgets import QListView
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt, QCoreApplication, QObject, pyqtSignal, pyqtSlot, QModelIndex, QItemSelectionModel, QSettings
+from PyQt6.QtGui import QKeySequence, QStandardItemModel, QStandardItem
+from PyQt6.QtWidgets import QListView
 from cn5X_config import *
 from msgbox import *
 from grblCom import grblCom
-
+from cn5X_toolChange import dlgToolChange
+from cn5X_gcodeParser import gcodeParser
 
 class gcodeFile(QObject):
   '''
@@ -48,23 +49,73 @@ class gcodeFile(QObject):
 
   sig_log     = pyqtSignal(int, str) # Message de fonctionnement du composant
 
-  def __init__(self, ui, gcodeFileUi: QListView):
+  def __init__(self, ui, gcodeFileUi: QListView, dialogToolChange: dlgToolChange):
     super().__init__()
     self.__filePath         = ""
     self.__ui               = ui
     self.__gcodeFileUi      = gcodeFileUi
     self.__gcodeFileUiModel = QStandardItemModel(self.__gcodeFileUi)
     self.__gcodeFileUiModel.itemChanged.connect(self.on_gcodeChanged)
+    self.__dlgToolChange = dialogToolChange
 
     self.__gcodeCharge      = False
     self.__gcodeChanged     = False
 
+    self.__settings = QSettings(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, ORG_NAME, APP_NAME)
+    self.__toolNumber    = 0
+    self.__firstToolDone = False
+
+    self.__gcodeParser = gcodeParser()
 
   def showFileOpen(self):
     ''' Affiche la boite de dialogue d'ouverture '''
-    opt = QtWidgets.QFileDialog.Options()
-    fName = QtWidgets.QFileDialog.getOpenFileName(None, self.tr("Open a GCode file"), "", self.tr("GCode file (*.gcode *.ngc *.nc *.gc *.cnc)"), options=opt)
+    fileDialog = QtWidgets.QFileDialog(None)
+    opt = fileDialog.options()
+    lastDir = self.__settings.value("Files/lastGCodeFileDir", "")
+    if lastDir != "":
+      fileDialog.setDirectory(lastDir)
+    fName = fileDialog.getOpenFileName(None, self.tr("Open a GCode file"), "", self.tr("GCode file (*.gcode *.ngc *.nc *.gc *.cnc)"), options=opt)
+    if fName[0] != "":
+      # Memorise le dernier répertoire utilisé
+      lastDir = os.path.dirname(fName[0])
+      self.__settings.setValue("Files/lastGCodeFileDir", lastDir)
+      # Met à jour la liste des 10 derniers fichiers utilisés
+      # Récupère la liste dans les settings
+      lastFiles = self.getLastFileList()
+      # Recherche si le fichier est déja dans la liste
+      if fName[0] in lastFiles:
+        # S'il l'est déjà, on le supprime
+        lastFiles.remove(fName[0])
+      # On l'insert en première position de la liste
+      lastFiles.insert(0, fName[0])
+      # Sauvegarde la nouvelle liste
+      self.saveLastFileList(lastFiles)
+
+      '''
+      for i in range(9, 0, -1):
+        settingName1 = "Files/lastFile{}".format(i)
+        settingName2 = "Files/lastFile{}".format(i-1)
+        self.__settings.setValue(settingName1, self.__settings.value(settingName2, ""))
+      self.__settings.setValue("Files/lastFile0", fName[0])
+      '''
+    # Renvoi le fichier à ouvrir
     return fName
+
+  def getLastFileList(self):
+    ''' Retrouve la liste des 10 derniers fichiers'''
+    liste = []
+    for i in range(10):
+      settingName = "Files/lastFile{}".format(i)
+      liste.append(self.__settings.value(settingName, ""))
+    return liste
+
+  def saveLastFileList(self, fileList):
+    i = 0
+    for f in fileList:
+      if i < 10:
+        settingName = "Files/lastFile{}".format(i)
+        self.__settings.setValue(settingName, f)
+        i = i + 1
 
   def readFile(self, filePath: str):
     self.sig_log.emit(logSeverity.info.value, self.tr("Reading file: {}").format(filePath))
@@ -113,7 +164,7 @@ class gcodeFile(QObject):
     ''' Selectionne un element de la liste du fichier GCode '''
     idx = self.__gcodeFileUiModel.index(num, 0, QModelIndex())
     self.__gcodeFileUi.selectionModel().clearSelection()
-    self.__gcodeFileUi.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectCurrent)
+    self.__gcodeFileUi.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.SelectCurrent)
 
 
   def getGCodeSelectedLine(self):
@@ -133,8 +184,9 @@ class gcodeFile(QObject):
 
   def showFileSave(self):
     ''' Affiche la boite de dialogue "Save as" '''
-    opt = QtWidgets.QFileDialog.Options()
-    opt |= QtWidgets.QFileDialog.DontUseNativeDialog
+    fileDialog = QtWidgets.QFileDialog(None)
+    opt = fileDialog.options()
+    opt |= QtWidgets.QFileDialog.Option.DontUseNativeDialog
     fName = QtWidgets.QFileDialog.getSaveFileName(None, self.tr("Save GCode file"), "", self.tr("GCode file (*.gcode *.ngc *.nc *.gc *.cnc)"), options=opt)
     return fName
 
@@ -168,7 +220,7 @@ class gcodeFile(QObject):
     """ Envoi des lignes de startLine a endLine dans la file d'attente du grblCom """
 
     # Force le curseur souris sablier
-    QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+    QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
     
     if endLine == -1:
       endLine = self.__gcodeFileUiModel.rowCount()
@@ -178,10 +230,51 @@ class gcodeFile(QObject):
       if self.__gcodeFileUiModel.data(idx) != "":
         gcodeLine = self.__gcodeFileUiModel.data(idx)
         if gcodeLine is not None:
-          com.gcodePush(gcodeLine)
+          dico  = self.__gcodeParser.wordDict(gcodeLine)
+          wlist = self.__gcodeParser.wordList(gcodeLine)
+
+          if ('T' in dico):
+            # Appel d'outil, on memorise le nouvel (ou futur) outil
+            # actif et on en force l'envoi vers Grbl.
+            try:
+              self.__toolNumber = int(float(dico['T']))
+            except ValueError as e:
+              # Erreur sur la valeur de T non numérique ou absente
+              self.sig_log.emit(logSeverity.error.value, self.tr("enQueue(): Invalid tool number (T) value '{}'.").format(dico['T']))
+              self.__toolNumber = 0
+            com.gcodePush("T{}".format(self.__toolNumber))
+            self.sig_log.emit(logSeverity.info.value, self.tr("enQueue(): Select tool number T{}.").format(self.__toolNumber))
+
+          if ("M6" in wlist):
+            # Demande de changement d'outil.
+            # La commande M6 ne sera pas envoyée à Grbl
+            if self.useToolChange():
+              # Traitement des changements d'outil manuels
+              if self.ignoreFirstToolChange() and not self.__firstToolDone:
+                # Ignore le premier changement d'outil du programme
+                # Si l'option est active, l'opérateur est sensé avoir
+                # déjà monté le premier outil avant le début de l'usinage
+                # donc, on ne fait rien (on trace juste dans la log)
+                self.sig_log.emit(logSeverity.info.value, self.tr("Ignoring first tool change (T{}).").format(self.__toolNumber))
+              else:
+                # Appel de la boite de dialogue de changement d'outil
+                RC = self.toolChange(self.__toolNumber)
+                if RC == QtWidgets.QDialog.Rejected:
+                  # Annulation du changement d'outil, on arrête le flux. 
+                  # Restore le curseur souris sablier en fin d'envoi
+                  QtWidgets.QApplication.restoreOverrideCursor()
+                  return False
+              if not self.__firstToolDone:
+                # Mémorise que le premier changement d'outil à eu lieu
+                self.__firstToolDone = True
+          else:
+            # Les autres commandes que M6 sont envoyées à Grbl 
+            com.gcodePush(gcodeLine)
+
+          # Force une mise à jour des status GCode
           com.gcodePush(CMD_GRBL_GET_GCODE_STATE, COM_FLAG_NO_OK)
 
-    # Restore le curseur souris sablier en fin d'initialisation
+    # Restore le curseur souris sablier en fin d'envoi
     QtWidgets.QApplication.restoreOverrideCursor()
 
 
@@ -265,4 +358,23 @@ class gcodeFile(QObject):
 
   def setGcodeChanged(self, value:bool):
     self.__gcodeChanged = value
+
+
+  def toolChange(self, toolNum: int):
+    ''' Appel de la boite de dialogue de changement d'outils '''
+    RC = self.__dlgToolChange.showDialog(toolNum)
+    if RC == QtWidgets.QDialog.Accepted:
+      self.sig_log.emit(logSeverity.info.value, self.tr("Tool change (T{}) done.").format(toolNum))
+    else: # RC = QtWidgets.QDialog.Rejected
+      self.sig_log.emit(logSeverity.warning.value, self.tr("Tool change (T{}) canceled.").format(toolNum))
+    return RC
+
+
+  def useToolChange(self):
+    return self.__settings.value("useToolChange", True, type=bool)
+
+
+  def ignoreFirstToolChange(self):
+    return self.__settings.value("ignoreFirstToolChange", False, type=bool)
+
 

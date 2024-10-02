@@ -2,7 +2,7 @@
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
-' Copyright 2018-2022 Gauthier Brière (gauthier.briere "at" gmail.com)    '
+' Copyright 2018-2024 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
 ' This file is part of cn5X++                                             '
 '                                                                         '
@@ -25,7 +25,7 @@ import sys, time
 import serial
 from enum import Enum
 from math import *
-from PyQt5.QtCore import QCoreApplication, QObject, QThread, QTimer, QEventLoop, pyqtSignal, pyqtSlot, QIODevice
+from PyQt6.QtCore import QCoreApplication, QObject, QThread, QTimer, QEventLoop, pyqtSignal, pyqtSlot, QIODevice
 from cn5X_config import *
 from grblComStack import grblStack
 
@@ -299,7 +299,7 @@ class grblComSerial(QObject):
           self.sig_connect.emit(False)
           return False
         try:
-          l = buff.decode().strip()
+          l = buff.decode('ascii').strip()
           self.sig_debug.emit(self.tr("grblComSerial.__openComPort(): line received: \"") + l + "\"")
           if l[:5] == "Grbl " and l[-5:] == "help]": # Init string : Grbl V.Mx ['$' for help]
             self.sig_debug.emit(self.tr("grblComSerial.__openComPort(): Grbl init string received in {:0.0f} ms, OK.").format(time.time()*1000 - tDebut))
@@ -365,7 +365,7 @@ class grblComSerial(QObject):
         try:
           # Lecture d'une ligne envoyée par Grbl
           buff = self.__comPort.readline()
-          l = buff.decode().strip()
+          l = buff.decode('ascii').strip()
           # Fin de lecture
           self.sig_activity.emit(False)
           if l.find('ok') >= 0 or l.find('error') >= 0 or l.find('ALARM') >= 0:

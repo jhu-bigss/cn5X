@@ -2,7 +2,7 @@
 
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 '                                                                         '
-' Copyright 2018-2022 Gauthier Brière (gauthier.briere "at" gmail.com)    '
+' Copyright 2018-2024 Gauthier Brière (gauthier.briere "at" gmail.com)    '
 '                                                                         '
 ' This file: grblProbe.py, is part of cn5X++                              '
 '                                                                         '
@@ -21,8 +21,8 @@
 '                                                                         '
 '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-from PyQt5 import QtCore
-from PyQt5.QtCore import QCoreApplication, QObject, pyqtSignal, pyqtSlot
+from PyQt6 import QtCore
+from PyQt6.QtCore import QCoreApplication, QObject, pyqtSignal, pyqtSlot
 from cn5X_config import *
 from grblCom import grblCom
 
@@ -49,7 +49,7 @@ class grblProbe(QObject):
                 X:float=None, Y:float=None, Z:float=None, 
                 A:float=None, B:float=None, C:float=None, 
                 U:float=None, V:float=None, W:float=None, 
-                F=0, 
+                F:float=0, 
                 g2p:bool=False
          ):
     '''
@@ -233,7 +233,7 @@ class probeResult(QObject):
 
 
   def getAxis(self, num: int):
-    '''Stocke une valeur d'axe'''
+    '''Renvoie une valeur d'axe'''
     if num < 0 or num > 5:
       raise ValueError("steAxisValue(): axisNum must be between 0 and 5")
     return self.__axis[num]
